@@ -1,0 +1,75 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# GridPulse — main configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+project:
+  name: gridpulse
+  version: 0.1.0
+
+kafka:
+  topic_events: grid_events
+  topic_anomalies: grid_anomalies
+  group_id: gridpulse
+  partitions: 3
+  replication_factor: 1          # single-node Redpanda
+  # Producer tuning for local dev — favour visibility over throughput
+  producer:
+    linger_ms: 10
+    compression: zstd
+
+streaming:
+  window_duration: "15 minutes"  # tumbling window
+  watermark: "30 minutes"        # accept events up to 30 min late
+  trigger_interval: "10 seconds" # micro-batch cadence
+  output_mode: append
+  checkpoint_dir: ./data/checkpoints
+
+features:
+  # Must match Project 1's anomaly detector input schema
+  feature_cols:
+    - load_mw_clean
+    - hour
+    - day_of_week
+    - is_weekend
+    - load_mw_clean_lag_24
+    - load_mw_clean_lag_168
+    - load_mw_clean_roll_mean_24
+    - load_mw_clean_roll_std_24
+
+agent:
+  # Safety / budget
+  max_iterations: 5
+  max_tool_calls_per_iteration: 3
+  timeout_per_tool_seconds: 20
+  # Severity classification buckets (used by classify_severity tool)
+  severity_buckets: [info, warning, critical]
+  # System prompt — kept in YAML for quick iteration
+  system_prompt: |
+    You are GridPulse, an on-call grid-operations AI assistant. An anomaly
+    has just been detected in the electricity-load stream for region {region}.
+
+    Your job is to:
+      1. Classify severity (info / warning / critical) using classify_severity
+      2. Gather context — get the 24h forecast and look up relevant prior art
+         via search_literature
+      3. Decide whether to alert humans and post a short incident report
+         (max ~10 lines) via post_incident_report — only if severity is
+         warning or critical
+      4. Stop once the report is posted (or if info-level, explain briefly
+         why no action was taken)
+
+    RULES:
+      - Cite papers inline as [arxiv_id, p.N] when you quote them
+      - Prefer brevity — operators read these on-call at 3am
+      - Never invent numbers that are not in tool results
+      - If a tool fails, try a different tool before giving up
+
+tools:
+  # Tool-specific overrides
+  search_literature:
+    top_k: 5
+    energyscholar_timeout_seconds: 60
+  get_24h_forecast:
+    horizon_hours: 24
+  post_incident_report:
+    suppress_below_severity: warning  # 'info' events are logged but not posted
