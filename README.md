@@ -1,6 +1,6 @@
 # ⚡ GridPulse — Real-time Grid Intelligence Agent
 
-> **Kafka → Spark Structured Streaming → MLflow-registered anomaly model → LLM agent with tool use → Discord alert.**
+> **Delta (or Kafka) → Spark Structured Streaming → MLflow-registered anomaly model → LLM agent with tool use → Discord alert.**
 
 Third project in the energy-forecasting portfolio. Where [`energy-forecasting-databricks`](https://github.com/jsanchez-ds/energy-forecasting-databricks) did classical ML and [`energyscholar-rag`](https://github.com/jsanchez-ds/energyscholar-rag) did LLM/RAG, **GridPulse is the streaming + agent layer that glues them into one system** — the anomaly detector is consumed from Project 1's MLflow registry, the literature lookup tool calls Project 2's HTTP endpoint, and the agent reasons over both.
 
@@ -8,11 +8,13 @@ Third project in the energy-forecasting portfolio. Where [`energy-forecasting-da
 
 ## 🏗️ Architecture
 
+The stream **transport is pluggable** (`STREAM_TRANSPORT=delta|kafka`). The default is a local Delta append stream — no Docker needed, Windows-friendly, and Spark Structured Streaming reads it with the same guarantees (checkpoints, watermarks, exactly-once) you would get from Kafka. Flip `STREAM_TRANSPORT=kafka` + `docker compose up redpanda` when you want the full broker.
+
 ```
 ┌──────────────────┐     ┌───────────────────┐     ┌─────────────────────┐
-│  EIA replay      │────▶│   Redpanda        │────▶│  Spark Structured   │
-│  (configurable   │     │   (Kafka API      │     │  Streaming          │
-│   speed-up)      │     │    compatible)    │     │                     │
+│  EIA replay      │────▶│  Delta append     │────▶│  Spark Structured   │
+│  (configurable   │     │  (default)  OR    │     │  Streaming          │
+│   speed-up)      │     │  Redpanda/Kafka   │     │                     │
 └──────────────────┘     └───────────────────┘     └──────────┬──────────┘
                                                               │
                                                               ▼
@@ -100,11 +102,12 @@ Third project in the energy-forecasting portfolio. Where [`energy-forecasting-da
 
 ### 1. Requirements
 - Python 3.11, Java 11 (for PySpark)
-- Docker Desktop (for Redpanda)
 - LLM API key — Groq or OpenRouter (free tiers fine)
+- **No Docker needed** on the default Delta transport
+- *(Optional)* Docker Desktop + `docker compose up redpanda` only when `STREAM_TRANSPORT=kafka`
 - A Discord webhook URL (optional) for live alerts
-- Project 1 MLflow registry with `energy-anomaly-detector@staging` (optional — we ship a local fallback)
-- Project 2 EnergyScholar FastAPI running (optional — tool gracefully degrades)
+- Project 1 MLflow registry with `energy-anomaly-detector@staging` (optional — falls back to a seasonal-naive baseline)
+- Project 2 EnergyScholar FastAPI running (optional — the `search_literature` tool degrades gracefully)
 
 ### 2. Setup
 
@@ -112,9 +115,10 @@ Third project in the energy-forecasting portfolio. Where [`energy-forecasting-da
 python -m venv .venv
 source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env          # paste LLM key + Discord webhook
+cp .env.example .env          # paste LLM key + Discord webhook (STREAM_TRANSPORT=delta)
 
-docker compose -f docker/docker-compose.yml up -d redpanda
+# Optional — only when STREAM_TRANSPORT=kafka
+# docker compose -f docker/docker-compose.yml up -d redpanda
 ```
 
 ### 3. Run
