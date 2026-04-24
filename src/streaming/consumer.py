@@ -1,20 +1,17 @@
 """
 Spark Structured Streaming consumer.
 
-Subscribes to the `grid_events` topic, parses JSON, windows the stream,
-and on each micro-batch calls the @staging Isolation Forest from the MLflow
-registry (loaded ONCE per executor) to flag anomalies. Anomalous rows are:
-  1. Written to a Delta sink (data/delta/anomalies)
-  2. Invoked against the GridPulse agent for incident analysis
+Reads either:
+  - a Delta table that the producer appends to (STREAM_TRANSPORT=delta) — DEFAULT
+  - a Kafka topic (STREAM_TRANSPORT=kafka) — needs Redpanda / Confluent
 
-The agent call is synchronous within the micro-batch — fine for v1 local
-scale (< a few anomalies per batch). For true production, buffer anomalies
-to a second Kafka topic and let the agent consume async.
+…windows the stream, calls the @staging Isolation Forest from Project 1
+on each micro-batch, persists results to Delta, and dispatches anomalies
+to the GridPulse agent.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +52,7 @@ EVENT_SCHEMA = StructType(
 )
 
 
-def _get_spark(app: str = "gridpulse-streaming") -> SparkSession:
+def _get_spark(app: str = "gridpulse-streaming", with_kafka: bool = False) -> SparkSession:
     builder = (
         SparkSession.builder.appName(app)
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
@@ -65,25 +62,24 @@ def _get_spark(app: str = "gridpulse-streaming") -> SparkSession:
         )
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.adaptive.enabled", "true")
-        .config(
-            "spark.jars.packages",
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3",
-        )
+        .config("spark.sql.shuffle.partitions", "4")
     )
+    extra_packages: list[str] = []
+    if with_kafka:
+        extra_packages.append("org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3")
+        builder = builder.config(
+            "spark.jars.packages", ",".join(extra_packages)
+        )
     try:
         from delta import configure_spark_with_delta_pip
 
-        builder = configure_spark_with_delta_pip(
-            builder,
-            extra_packages=["org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3"],
-        )
+        builder = configure_spark_with_delta_pip(builder, extra_packages=extra_packages)
     except ImportError:
         pass
     return builder.getOrCreate()
 
 
 def _load_anomaly_model() -> Any:
-    """Load the Project-1 anomaly detector from the local MLflow registry."""
     env = get_env()
     mlflow.set_tracking_uri(env.mlflow_tracking_uri)
     uri = f"models:/{env.anomaly_model}@{env.anomaly_alias}"
@@ -92,9 +88,8 @@ def _load_anomaly_model() -> Any:
 
 
 def _enrich_with_anomaly(pdf, model, feature_cols: list[str]):
-    """Run the loaded sklearn model over a pandas batch and tag each row."""
     X = pdf[feature_cols].fillna(pdf[feature_cols].mean(numeric_only=True))
-    preds = model.predict(X)        # -1 = anomaly, +1 = normal
+    preds = model.predict(X)
     scores = model.decision_function(X)
     pdf = pdf.copy()
     pdf["is_anomaly"] = (preds == -1).astype(int)
@@ -103,8 +98,6 @@ def _enrich_with_anomaly(pdf, model, feature_cols: list[str]):
 
 
 def _dispatch_agent(anomaly_rows: list[dict]) -> None:
-    """Hand anomalies off to the agent. Lazy import so the streaming job
-    can still run if the agent package has a problem."""
     if not anomaly_rows:
         return
     try:
@@ -121,8 +114,9 @@ def _foreach_batch(batch_df: DataFrame, batch_id: int, model, feature_cols: list
         return
     pdf = batch_df.toPandas()
     pdf = _enrich_with_anomaly(pdf, model, feature_cols)
+    log.info("batch.done", batch_id=batch_id, rows=len(pdf),
+             anomalies=int(pdf["is_anomaly"].sum()))
 
-    # Persist everything (append) for the dashboard
     spark = batch_df.sparkSession
     enriched = spark.createDataFrame(pdf)
     (
@@ -131,20 +125,68 @@ def _foreach_batch(batch_df: DataFrame, batch_id: int, model, feature_cols: list
         .save(f"{delta_path}/events_scored")
     )
 
-    # Split anomalies, persist + dispatch
     anomalies = pdf[pdf["is_anomaly"] == 1]
     if not anomalies.empty:
         spark.createDataFrame(anomalies).write.format("delta").mode("append").save(
             f"{delta_path}/anomalies"
         )
-        log.info("batch.anomalies", batch_id=batch_id, n=len(anomalies))
         _dispatch_agent(anomalies.to_dict(orient="records"))
+
+
+def _build_source(spark: SparkSession, env, cfg) -> DataFrame:
+    """Return a streaming DataFrame with the EVENT_SCHEMA regardless of transport."""
+    if env.stream_transport == "kafka":
+        raw = (
+            spark.readStream.format("kafka")
+            .option("kafka.bootstrap.servers", env.kafka_bootstrap)
+            .option("subscribe", env.kafka_topic_events)
+            .option("startingOffsets", "latest")
+            .load()
+        )
+        return (
+            raw.selectExpr("CAST(value AS STRING) as json_str")
+            .select(F.from_json("json_str", EVENT_SCHEMA).alias("e"))
+            .select("e.*")
+        )
+
+    # Default: Delta source — the producer appends events to this path.
+    Path(env.stream_delta_path).mkdir(parents=True, exist_ok=True)
+    # Ensure the table exists before the streaming reader attaches (avoids the
+    # "table not found" race on first startup with no producer output yet).
+    if not (Path(env.stream_delta_path) / "_delta_log").exists():
+        from deltalake import write_deltalake
+        import pandas as pd
+
+        empty = pd.DataFrame(
+            {
+                "event_id": pd.Series([], dtype="string"),
+                "timestamp_utc": pd.Series([], dtype="datetime64[ns, UTC]"),
+                "region": pd.Series([], dtype="string"),
+                "load_mw": pd.Series([], dtype="float64"),
+                "hour": pd.Series([], dtype="int64"),
+                "day_of_week": pd.Series([], dtype="int64"),
+                "is_weekend": pd.Series([], dtype="int64"),
+                "load_mw_clean_lag_24": pd.Series([], dtype="float64"),
+                "load_mw_clean_lag_168": pd.Series([], dtype="float64"),
+                "load_mw_clean_roll_mean_24": pd.Series([], dtype="float64"),
+                "load_mw_clean_roll_std_24": pd.Series([], dtype="float64"),
+                "ingested_at": pd.Series([], dtype="datetime64[ns, UTC]"),
+            }
+        )
+        write_deltalake(env.stream_delta_path, empty, mode="overwrite")
+
+    return (
+        spark.readStream.format("delta")
+        .option("ignoreDeletes", "true")
+        .option("ignoreChanges", "true")
+        .load(env.stream_delta_path)
+    )
 
 
 def run() -> None:
     env = get_env()
     cfg = load_yaml_config()
-    spark = _get_spark()
+    spark = _get_spark(with_kafka=(env.stream_transport == "kafka"))
     spark.sparkContext.setLogLevel("WARN")
 
     feature_cols = cfg["features"]["feature_cols"]
@@ -154,19 +196,8 @@ def run() -> None:
     checkpoint_dir = cfg["streaming"]["checkpoint_dir"]
     Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-    raw = (
-        spark.readStream.format("kafka")
-        .option("kafka.bootstrap.servers", env.kafka_bootstrap)
-        .option("subscribe", env.kafka_topic_events)
-        .option("startingOffsets", "latest")
-        .load()
-    )
-
-    parsed = (
-        raw.selectExpr("CAST(value AS STRING) as json_str")
-        .select(F.from_json("json_str", EVENT_SCHEMA).alias("e"))
-        .select("e.*")
-        .withWatermark("timestamp_utc", cfg["streaming"]["watermark"])
+    parsed = _build_source(spark, env, cfg).withWatermark(
+        "timestamp_utc", cfg["streaming"]["watermark"]
     )
 
     query = (
@@ -178,7 +209,7 @@ def run() -> None:
         .trigger(processingTime=cfg["streaming"]["trigger_interval"])
         .start()
     )
-    log.info("stream.started")
+    log.info("stream.started", transport=env.stream_transport)
     query.awaitTermination()
 
 
