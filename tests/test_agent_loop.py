@@ -101,11 +101,13 @@ def test_agent_hits_max_iterations(mock_env, one_tool_registry, monkeypatch):
     cfg["agent"]["max_iterations"] = 2
 
     def infinite_tool_caller():
+        counter = 0
         while True:
+            counter += 1
             yield ChatResult(
                 text=None,
                 tool_calls=[ToolCall(
-                    id=f"c{i}", name="classify_severity",
+                    id=f"c{counter}", name="classify_severity",
                     arguments={"anomaly_score": -0.02, "load_mw": 1.0, "region": "CAL"},
                 )],
                 model="m", provider="groq",

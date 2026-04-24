@@ -20,11 +20,17 @@ class EnvSettings(BaseSettings):
     anthropic_api_key: str = ""
     openai_api_key: str = ""
 
-    # Kafka
+    # Stream transport — "delta" (no Docker needed) or "kafka" (Redpanda)
+    stream_transport: Literal["delta", "kafka"] = "delta"
+
+    # Kafka (used when stream_transport == "kafka")
     kafka_bootstrap: str = "localhost:19092"
     kafka_topic_events: str = "grid_events"
     kafka_topic_anomalies: str = "grid_anomalies"
     kafka_group_id: str = "gridpulse"
+
+    # Delta stream source (used when stream_transport == "delta")
+    stream_delta_path: str = "./data/stream/events"
 
     # Source data
     replay_source: str = "../Nuevo proyecto/data/gold/load_features"
