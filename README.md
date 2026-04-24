@@ -1,3 +1,5 @@
+🌐 **English** · [Español](README.es.md)
+
 # ⚡ GridPulse — Real-time Grid Intelligence Agent
 
 > **Delta (or Kafka) → Spark Structured Streaming → MLflow-registered anomaly model → LLM agent with tool use → Discord alert.**
