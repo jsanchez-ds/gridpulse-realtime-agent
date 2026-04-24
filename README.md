@@ -173,6 +173,15 @@ thresholds:
 Every number in the report came from a tool call — the LLM never hallucinated
 a figure. That is the whole point of the tool registry + JSON-schema contract.
 
+### Live Discord alert
+
+![GridPulse Discord alert](docs/images/discord_alert.png)
+
+The red `[CRITICAL]` embed in the on-call channel — posted autonomously by
+the agent after it had classified the severity, consulted the Project-1
+forecaster, queried the Project-2 RAG for literature, and decided that the
+deviation warranted human attention.
+
 ---
 
 ## 📜 License
